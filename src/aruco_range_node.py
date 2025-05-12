@@ -4,6 +4,7 @@ import rospy
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Int32
 from localisation.msg import ArucoRange
+from visualization_msgs.msg import Marker
 import math
 
 class ArucoRangeNode:
@@ -15,7 +16,7 @@ class ArucoRangeNode:
         rospy.Subscriber("/aruco_single/pose", PoseStamped, self.pose_callback)
 
         # Subscribe to aruco id
-        rospy.Subscriber("/aruco_single/marker", Int32, self.id_callback)
+        rospy.Subscriber("/aruco_single/marker", Marker, self.marker_callback)
 
         # Publisher for aruco range
         self.range_pub = rospy.Publisher("/aruco_range", ArucoRange, queue_size=10)
@@ -26,8 +27,8 @@ class ArucoRangeNode:
         # Keep the node running
         rospy.spin()
 
-    def id_callback(self, msg):
-        self.latest_id = msg.data
+    def marker_callback(self, msg):
+        self.latest_id = msg.id
 
     def pose_callback(self, msg):
         # Skip if no marker has been detected yet

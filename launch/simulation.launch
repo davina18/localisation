@@ -1,12 +1,13 @@
 <launch>
     <!-- Launch Stonefish simulation -->
-    <include file="$(find turtlebot_simulation)/launch/turtlebot_hol_circuit2_aruco.launch"/>
+    <include file="$(find localisation)/launch/turtlebot_hol_circuit2_aruco.launch"/>
 
-    <!-- Launch odometry, IMU and aruco nodes -->
-    <node pkg="localisation" type="wheel_odom_node.py" name="wheel_odom_node" output="screen"/>
+    <!-- Launch FEKFSLAM, IMU and aruco nodes -->
     <node pkg="localisation" type="imu_node.py" name="imu_node" output="screen"/>
     <node pkg="localisation" type="aruco_range_node.py" name="aruco_range_node" output="screen"/>
-
+    <!-- <node pkg="localisation" type="fekfslam.py" name="fekfslam" output="screen"/> -->
+    <node pkg="localisation" type="controller.py" name="controller_node" output="screen"/>
+    
     <!-- Launch aruco_detection from aruco_ros -->
     <include file="$(find aruco_ros)/launch/aruco_detection.launch"/>
 
