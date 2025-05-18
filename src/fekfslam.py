@@ -181,7 +181,7 @@ class FEKFSLAM(EKFNode):
         pose.pose = msg.pose.pose
         self.ground_truth_path.poses.append(pose)
         self.ground_truth_path_pub.publish(self.ground_truth_path)
-        self.publish_ground_truth_path_marker()
+        #self.publish_ground_truth_path_marker()
 
     def update_paths(self):
         """Update both estimated and ground truth paths"""
@@ -202,7 +202,7 @@ class FEKFSLAM(EKFNode):
         # Publish uncertainty ellipse
         self.publish_uncertainty_ellipse()
         self.publish_estimated_path_marker()
-        self.publish_ground_truth_path_marker()
+        #self.publish_ground_truth_path_marker()
 
     def publish_uncertainty_ellipse(self):
         """Visualize robot pose uncertainty as a 2D ellipse using GetEllipse()"""
@@ -356,7 +356,7 @@ class FEKFSLAM(EKFNode):
                     rospy.logwarn(f"Triangulation failed for Aruco ID {aruco_id}")
                     return None
                 # Manually set an initial covariance for the new landmark
-                cov = np.diag([0.5, 0.5])
+                cov = np.diag([0.2, 0.2])
                 # Print uncertainty ellipse area before new landmark addition
                 area_before = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))
                 # Add the new landmark to the robot state using the estimated pos and cov

@@ -25,7 +25,7 @@ class EKFNode:
         # State variables
         self.xk_1 = np.zeros((self.xB_dim, 1))
         self.Pk_1 = np.diag([0.1, 0.1, 0.1])
-        self.Qk = np.diag([0.1, 0.1, 0.1])
+        self.Qk = np.diag([0.1, 0.1])
         
         # Current time
         self.current_time = rospy.Time.now()
