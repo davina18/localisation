@@ -70,31 +70,34 @@ class EKFNode:
         v = uk[0]
         w = uk[1]
         t = uk[2]
+        theta = xk[2, 0]
         
         # Initialize xk_bar properly
         xk_bar = xk.copy()
-        xk_bar[:self.xB_dim] = xk[:self.xB_dim]
-        
-        # Jacobian calculations
+        xk_bar[0, 0] += np.cos(theta) * v * t
+        xk_bar[1, 0] += np.sin(theta) * v * t
+        xk_bar[2, 0] = (theta + w * t + np.pi) % (2 * np.pi) - np.pi  # wrap angle
+            
+        # Jacobians w.r.t robot state (F1) and control input noise (F2)
         F1 = np.array([
-            [1.0, 0.0, -np.sin(xk[2,0]) * v * t],
-            [0.0, 1.0, np.cos(xk[2,0]) * v * t],
-            [0.0, 0.0, 1.0]
+            [1.0, 0.0, -np.sin(theta) * v * t],
+            [0.0, 1.0,  np.cos(theta) * v * t],
+            [0.0, 0.0,  1.0]
         ])
-        
-        F2 = np.array([
-            [np.cos(xk[2,0])*t*0.5*self.wheel_radius, np.cos(xk[2,0])*t*0.5*self.wheel_radius, 0.0],
-            [np.sin(xk[2,0])*t*0.5*self.wheel_radius, np.sin(xk[2,0])*t*0.5*self.wheel_radius, 0.0],
-            [(t*self.wheel_radius)/self.wheel_base_distance, -(t*self.wheel_radius)/self.wheel_base_distance, 1.0]
-        ])
-        
-        # Extended Jacobians 
 
-        Pxx = np.eye(len(xk))
-        Pyy = np.zeros((len(xk), len(Qk)))
+        F2 = np.array([
+            [np.cos(theta) * t, 0],
+            [np.sin(theta) * t, 0],
+            [0, t]
+        ])
         
-        Pxx[:self.xB_dim, :self.xB_dim] = F1
-        Pyy[:self.xB_dim, :len(Qk)] = F2
+        # Extend Jacobians to match state size
+        n = len(xk)  # full state length
+        Pxx = np.eye(n)
+        Pyy = np.zeros((n, 2))  # Qk must be 2x2: noise for [v, w]
+
+        Pxx[:3, :3] = F1
+        Pyy[:3, :2] = F2
 
         # Update the state covariance matrix
         Pk_bar = Pxx @ Pk @ Pxx.T + Pyy @ Qk @ Pyy.T
@@ -122,19 +125,19 @@ class EKFNode:
         # Covariance matrix
         odom.pose.covariance = [0.0] * 36
         # x row
-        odom.pose.covariance[0]  = Pk[0, 0]  # x–x
-        odom.pose.covariance[1]  = Pk[0, 1]  # x–y
-        odom.pose.covariance[5]  = Pk[0, 2]  # x–yaw
+        odom.pose.covariance[0]  = Pk[0, 0]  # x–x (uncertainty in x)
+        odom.pose.covariance[1]  = Pk[0, 1]  # x–y (x-y covariance)
+        odom.pose.covariance[5]  = Pk[0, 2]  # x–yaw (x-yaw covariance)
 
         # y row
-        odom.pose.covariance[6]  = Pk[1, 0]  # y–x
-        odom.pose.covariance[7]  = Pk[1, 1]  # y–y
-        odom.pose.covariance[11] = Pk[1, 2]  # y–yaw
+        odom.pose.covariance[6]  = Pk[1, 0]  # y–x (y-x covariance)
+        odom.pose.covariance[7]  = Pk[1, 1]  # y–y (uncertainty in y)
+        odom.pose.covariance[11] = Pk[1, 2]  # y–yaw (y-yaw covariance)
 
         # yaw row
-        odom.pose.covariance[30] = Pk[2, 0]  # yaw–x
-        odom.pose.covariance[31] = Pk[2, 1]  # yaw–y
-        odom.pose.covariance[35] = Pk[2, 2]  # yaw–yaw
+        odom.pose.covariance[30] = Pk[2, 0]  # yaw–x (yaw-x covariance)
+        odom.pose.covariance[31] = Pk[2, 1]  # yaw–y (yaw-y covariance)
+        odom.pose.covariance[35] = Pk[2, 2]  # yaw–yaw (uncertainty in yaw)
 
         
         self.odom_pub.publish(odom)

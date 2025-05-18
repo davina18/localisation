@@ -29,13 +29,12 @@ class FEKFSLAM(EKFNode):
         # Initial robot pose and covariance
         self.xk = np.zeros((self.xB_dim, 1))
         self.Pk = np.diag([0.1, 0.1, 0.1])
-        self.Qk = np.diag([0.1, 0.1, 0.1])  # Process noise (if not already in EKFNode)
+        self.Qk = np.diag([0.1, 0.1])  # Process noise (if not already in EKFNode)
 
         # Wheel parameters
         self.wheel_radius = 0.035  # meters
         self.wheel_base_distance = 0.23  # meters
         #self.Qk = np.diag([0.05, 0.05, 0.01])  # process noise covariance
-
 
         # Wheel joint names
         self.left_wheel_name = 'turtlebot/kobuki/wheel_left_joint'
@@ -60,6 +59,10 @@ class FEKFSLAM(EKFNode):
         # Flag to wait until both velocities are received
         self.left_wheel_velocity_received = False
 
+        # Aruco observations
+        self.aruco_observations = {}  # {aruco_id: [(robot_pose, range)]}
+        self.triangulation_dist_threshold = 0.3
+
         # Marker tracking
         self.observed_arucos = {}  # {aruco_id: (state_index, last_seen_time)}
         self.next_feature_idx = 0
@@ -72,6 +75,7 @@ class FEKFSLAM(EKFNode):
 
         # Publishers
         self.estimated_path_pub = rospy.Publisher("/estimated_path", Path, queue_size=10)
+        self.ground_truth_path_pub = rospy.Publisher("/ground_truth_path", Path, queue_size=10)
         self.estimated_path_marker_pub = rospy.Publisher("/estimated_path_marker", Marker, queue_size=10)
         self.ground_truth_path_marker_pub = rospy.Publisher("/ground_truth_path_marker", Marker, queue_size=10)
         self.ground_truth_pub = rospy.Publisher("/ground_truth_path", Path, queue_size=10)
@@ -88,11 +92,7 @@ class FEKFSLAM(EKFNode):
 
         # Ground truth pose tracking (optional)
         self.ground_truth_position = np.zeros(3)
-        rospy.Subscriber("/ground_truth_odom", Odometry, self.gt_odom_callback)
-
-        rospy.loginfo("FEKF-SLAM node initialized")
-
-
+        rospy.Subscriber("/turtlebot/kobuki/odom_ground_truth", Odometry, self.gt_odom_callback)
 
     def wrap_angle(self, angle):
         return np.arctan2(np.sin(angle), np.cos(angle))
@@ -128,7 +128,7 @@ class FEKFSLAM(EKFNode):
 
             uk = [self.linear_velocity, self.angular_velocity, self.time]
             self.xk, self.Pk = self.prediction(uk, self.Qk, self.xk, self.Pk)
-            rospy.loginfo(f"Updated pose: x={self.xk[0,0]:.2f}, y={self.xk[1,0]:.2f}, yaw={self.xk[2,0]:.2f}")
+            #rospy.loginfo(f"Updated pose: x={self.xk[0,0]:.2f}, y={self.xk[1,0]:.2f}, yaw={self.xk[2,0]:.2f}")
             if np.isnan(self.xk).any():
                 rospy.logwarn("NaN detected in xk after prediction!")
             self.update_paths()
@@ -180,11 +180,12 @@ class FEKFSLAM(EKFNode):
         pose.header = msg.header
         pose.pose = msg.pose.pose
         self.ground_truth_path.poses.append(pose)
-        self.ground_truth_pub.publish(self.ground_truth_path)
+        self.ground_truth_path_pub.publish(self.ground_truth_path)
+        self.publish_ground_truth_path_marker()
 
     def update_paths(self):
         """Update both estimated and ground truth paths"""
-        rospy.loginfo("Appending estimated pose to path")
+        #rospy.loginfo("Appending estimated pose to path")
 
         # Estimated path
         est_pose = PoseStamped()
@@ -196,7 +197,7 @@ class FEKFSLAM(EKFNode):
         est_pose.pose.orientation = Quaternion(*quaternion_from_euler(0, 0, self.xk[2,0]))
         self.estimated_path.poses.append(est_pose)
         self.estimated_path_pub.publish(self.estimated_path)
-        rospy.loginfo(f"Publishing path with {len(self.estimated_path.poses)} poses")
+        #rospy.loginfo(f"Publishing path with {len(self.estimated_path.poses)} poses")
         
         # Publish uncertainty ellipse
         self.publish_uncertainty_ellipse()
@@ -263,6 +264,8 @@ class FEKFSLAM(EKFNode):
         self.estimated_path_marker_pub.publish(marker)
 
     def publish_ground_truth_path_marker(self):
+        if len(self.ground_truth_path.poses) < 2:
+            return
 
         marker = Marker()
         marker.header.frame_id = "world_ned"
@@ -324,40 +327,90 @@ class FEKFSLAM(EKFNode):
 
     def range_callback(self, msg):
         """Handle new range measurement"""
-        try:
-            current_time = rospy.Time.now().to_sec()
-            aruco_id = msg.aruco_id
-            range_meas = msg.range
-            Rn = np.array([[0.3]])  # Measurement noise
-            
-            # If revisiting a marker, reduce its position uncertainty
-            if aruco_id in self.observed_arucos:
-                idx, last_seen = self.observed_arucos[aruco_id]
-                time_since_last_seen = current_time - last_seen
-                
-                # Adjust measurement noise based on time since last seen
-                if time_since_last_seen < 5.0:  # Recently seen - high confidence
-                    Rn *= 0.1
-                else:  # Not seen for a while - increasing uncertainty
-                    Rn *= min(1.0 + time_since_last_seen/10.0, 5.0)
-                
-                self.observed_arucos[aruco_id] = (idx, current_time)
-            
-            # Perform update
-            self.xk, self.Pk = self.update(
-                self.xk, self.Pk, 
-                range_meas, Rn, 
-                aruco_id
-            )
-            
-            # Visualize
-            self.update_paths()
-            self.visualize_range_circle(range_meas)
-            self.visualize_all_landmarks()
-            
-        except Exception as e:
-            rospy.logerr(f"Range callback error: {str(e)}")
+        aruco_id = msg.aruco_id
+        range_measurement = msg.range
+        current_pose = self.xk[0:3, 0].copy()  # [x, y, theta]
 
+        # If the aruco hasn't been observed before, initialise an observation list for it
+        if aruco_id not in self.aruco_observations:
+            self.aruco_observations[aruco_id] = []
+
+        # Add the robots current pose and range measurement to the arucos observation list
+        self.aruco_observations[aruco_id].append((current_pose, range_measurement))
+
+        observations = self.aruco_observations[aruco_id]
+        # If at least 2 observations of this aruco have been made
+        if len(observations) >= 2:
+            # Compute the Euclidean distance between the first pose and most recent pose 
+            p1, _ = observations[0]
+            p2, _ = observations[-1]
+            dist = np.linalg.norm(p2[0:2] - p1[0:2])
+            # Only triangulate if lower than the distance threshold
+            if dist >= self.triangulation_dist_threshold:
+                if aruco_id in self.observed_arucos:
+                    return # aruco already added to state
+                # Estimate the position of the landmark using triangulation
+                landmark_pos = self.triangulate(observations)
+                # Report triangulation failure
+                if landmark_pos is None:
+                    rospy.logwarn(f"Triangulation failed for Aruco ID {aruco_id}")
+                    return None
+                # Manually set an initial covariance for the new landmark
+                cov = np.diag([0.5, 0.5])
+                # Print uncertainty ellipse area before new landmark addition
+                area_before = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))
+                # Add the new landmark to the robot state using the estimated pos and cov
+                self.add_new_landmark(aruco_id, landmark_pos, cov)
+                # Update step
+                Rn = np.array([[0.1]])  # measurement noise
+                self.xk, self.Pk = self.update(self.xk, self.Pk, range_measurement, Rn, aruco_id)
+                # Print uncertainty ellipse area after new landmark addition
+                area_after = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))
+                rospy.loginfo(f"Uncertainty ellipse area before: {area_before:.4f}, after: {area_after:.4f}")
+                self.visualize_range_circle(np.linalg.norm(landmark_pos - self.xk[0:2, 0].reshape(2,1)))
+                del self.aruco_observations[aruco_id]
+                rospy.loginfo(f"Added landmark {aruco_id} at {landmark_pos.ravel()} with covariance {np.diag(cov)}")
+
+    def triangulate(self, observations):
+        # Estimate landmark position using least-squares
+        A = []
+        b = []
+        # For each observation of this aruco
+        for (pose, r) in observations:
+            x, y, theta = pose
+            xi = x + r * np.cos(theta) # estimated x-position of the landmark
+            yi = y + r * np.sin(theta) # estimated y-position of the landmark
+
+            # Build linear system using the circle equation
+            A.append([-2 * xi, -2 * yi])
+            b.append(-(xi**2 + yi**2 - r**2))
+
+        A = np.array(A) 
+        b = np.array(b).reshape(-1, 1)
+
+        # Solve the least squares problem: A * [x; y] = b
+        landmark_est = np.linalg.lstsq(A, b, rcond=None)[0]
+
+        return landmark_est
+    
+    def add_new_landmark(self, aruco_id, position, covariance):
+        # Skip if the landmark has already been added to the state
+        if aruco_id in self.observed_arucos:
+            return
+
+        # Add the new landmarks position to the state vector
+        self.xk = np.vstack([self.xk, position.reshape(2, 1)])
+        # Initialise cross-covariance to 0 (uncorrelated initially)
+        cross_cov = np.zeros((self.Pk.shape[0], 2))
+        # Expand covariance matrix to include the new landmark
+        self.Pk = np.block([
+            [self.Pk, cross_cov],
+            [cross_cov.T, covariance]
+        ])
+
+        # Log observation of aruco
+        self.observed_arucos[aruco_id] = (self.next_feature_idx, rospy.Time.now().to_sec())
+        self.next_feature_idx += 1
 
 
     # ---------------------- SLAM Functions ----------------------
@@ -416,8 +469,8 @@ class FEKFSLAM(EKFNode):
             zn = np.array([[zn]])
 
         # Check if this is a new feature
-        if aruco_id not in self.observed_arucos:
-            return self.AddNewFeatures(xk, Pk, zn, Rn, aruco_id)
+        #if aruco_id not in self.observed_arucos:
+        #    return self.AddNewFeatures(xk, Pk, zn, Rn, aruco_id)
 
         # Existing feature update
         #idx = (len(self.observed_arucos))
