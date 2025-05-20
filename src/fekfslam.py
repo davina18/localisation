@@ -11,6 +11,7 @@ from sensor_msgs.msg import Imu
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import PoseStamped, Point, Quaternion, PoseWithCovariance
 from localisation.msg import ArucoRange
+from scipy.optimize import least_squares
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from math import sin, cos, atan2, sqrt
 from efk import EKFNode
@@ -24,11 +25,11 @@ class FEKFSLAM(EKFNode):
 
         # State dimensions
         self.xB_dim = 3  # Robot state: [x, y, theta]
-        self.xF_dim = 2  # Feature state: [x, y]
+        self.xF_dim = 3  # Feature state: [x, y, z]
 
         # Initial robot pose and covariance
         self.xk = np.zeros((self.xB_dim, 1))
-        self.Pk = np.diag([0.1, 0.1, 0.1])
+        self.Pk = np.diag([0.0, 0.0, 0.0])
         self.Qk = np.diag([0.1, 0.1])  # Process noise (if not already in EKFNode)
 
         # Wheel parameters
@@ -135,8 +136,6 @@ class FEKFSLAM(EKFNode):
 
             self.left_wheel_velocity_received = False
             self.right_wheel_velocity_received = False
-
-
 
     '''def imu_callback(self, msg):
             """
@@ -319,18 +318,19 @@ class FEKFSLAM(EKFNode):
             [sin(theta)]
         ])
 
-    def h_range(self, x_r, y_r, x_f, y_f):
+    def h_range(self, x_r, y_r, z_r, x_f, y_f, z_f):
         """Range measurement model"""
         dx = x_f - x_r
         dy = y_f - y_r
-        return sqrt(dx**2 + dy**2)
+        dz = z_f - z_r
+        return sqrt(dx**2 + dy**2 + dz**2)
 
     def range_callback(self, msg):
         """Handle new range measurement"""
         aruco_id = msg.aruco_id
         range_measurement = msg.range
         current_pose = self.xk[0:3, 0].copy()  # [x, y, theta]
-
+        
         # If the aruco hasn't been observed before, initialise an observation list for it
         if aruco_id not in self.aruco_observations:
             self.aruco_observations[aruco_id] = []
@@ -340,7 +340,7 @@ class FEKFSLAM(EKFNode):
 
         observations = self.aruco_observations[aruco_id]
         # If at least 2 observations of this aruco have been made
-        if len(observations) >= 2:
+        if len(observations) >= 3:
             # Compute the Euclidean distance between the first pose and most recent pose 
             p1, _ = observations[0]
             p2, _ = observations[-1]
@@ -356,7 +356,7 @@ class FEKFSLAM(EKFNode):
                     rospy.logwarn(f"Triangulation failed for Aruco ID {aruco_id}")
                     return None
                 # Manually set an initial covariance for the new landmark
-                cov = np.diag([0.2, 0.2])
+                cov = np.diag([0.2, 0.2, 0.2])
                 # Print uncertainty ellipse area before new landmark addition
                 area_before = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))
                 # Add the new landmark to the robot state using the estimated pos and cov
@@ -367,31 +367,38 @@ class FEKFSLAM(EKFNode):
                 # Print uncertainty ellipse area after new landmark addition
                 area_after = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))
                 rospy.loginfo(f"Uncertainty ellipse area before: {area_before:.4f}, after: {area_after:.4f}")
-                self.visualize_range_circle(np.linalg.norm(landmark_pos - self.xk[0:2, 0].reshape(2,1)))
+                self.visualize_range_circle(np.linalg.norm(landmark_pos[0:2] - self.xk[0:2, 0].reshape(2,1)))
                 del self.aruco_observations[aruco_id]
                 rospy.loginfo(f"Added landmark {aruco_id} at {landmark_pos.ravel()} with covariance {np.diag(cov)}")
 
     def triangulate(self, observations):
-        # Estimate landmark position using least-squares
-        A = []
-        b = []
-        # For each observation of this aruco
-        for (pose, r) in observations:
-            x, y, theta = pose
-            xi = x + r * np.cos(theta) # estimated x-position of the landmark
-            yi = y + r * np.sin(theta) # estimated y-position of the landmark
+        def residuals(landmark_pos, observations):
+            # Compute residuals (difference between predicted and observed range)
+            residual_list = []
+            lx, ly, lz = landmark_pos  # estimated landmark position
+            for pose, r in observations:
+                x, y, theta = pose  # robot pose
+                dx = lx - x # x difference
+                dy = ly - y # y difference
+                dz = lz  # assume robot z = 0, so dz = lz - 0
+                predicted_range = np.sqrt(dx**2 + dy**2 + dz**2) # Euclidean distance
+                residual_list.append(predicted_range - r)  # add residual (predicted - observed)
+            return residual_list
 
-            # Build linear system using the circle equation
-            A.append([-2 * xi, -2 * yi])
-            b.append(-(xi**2 + yi**2 - r**2))
-
-        A = np.array(A) 
-        b = np.array(b).reshape(-1, 1)
-
-        # Solve the least squares problem: A * [x; y] = b
-        landmark_est = np.linalg.lstsq(A, b, rcond=None)[0]
-
-        return landmark_est
+        # Generate initial estimate of the landmark position (using simplified asusumptions)
+        last_pose, last_range = observations[-1] # latest robot pose and range measurement
+        # Estimate landmark position as being directly ahead, using robots heading and range measurement
+        x0 = last_pose[0] + last_range * np.cos(last_pose[2])
+        y0 = last_pose[1] + last_range * np.sin(last_pose[2])
+        z0 = 0.0  # assume landmark is on the ground
+        
+        # Use least squares to minimise residuals and estimate landmark position
+        result = least_squares(residuals, x0=[x0, y0, z0], args=(observations,))
+        
+        if result.success:
+            return result.x.reshape(3, 1) # in world_ned since its derived from robot poses in world_ned
+        else:
+            return None  # triangulation failed
     
     def add_new_landmark(self, aruco_id, position, covariance):
         # Skip if the landmark has already been added to the state
@@ -399,9 +406,9 @@ class FEKFSLAM(EKFNode):
             return
 
         # Add the new landmarks position to the state vector
-        self.xk = np.vstack([self.xk, position.reshape(2, 1)])
+        self.xk = np.vstack([self.xk, position.reshape(3, 1)])
         # Initialise cross-covariance to 0 (uncorrelated initially)
-        cross_cov = np.zeros((self.Pk.shape[0], 2))
+        cross_cov = np.zeros((self.Pk.shape[0], 3))
         # Expand covariance matrix to include the new landmark
         self.Pk = np.block([
             [self.Pk, cross_cov],
@@ -411,7 +418,6 @@ class FEKFSLAM(EKFNode):
         # Log observation of aruco
         self.observed_arucos[aruco_id] = (self.next_feature_idx, rospy.Time.now().to_sec())
         self.next_feature_idx += 1
-
 
     # ---------------------- SLAM Functions ----------------------
 
@@ -476,14 +482,19 @@ class FEKFSLAM(EKFNode):
         #idx = (len(self.observed_arucos))
         idx, _ = self.observed_arucos[aruco_id]
         start_idx = self.xB_dim + idx * self.xF_dim
-        self.observed_arucos[aruco_id] = idx
+        self.observed_arucos[aruco_id] = (idx, rospy.Time.now().to_sec())
 
         # Get current states
         x_r, y_r, theta_r = xk[0:3, 0]
-        x_f, y_f = xk[start_idx:start_idx+2, 0]
+        z_r = 0.0
+        x_f, y_f, z_f = xk[start_idx:start_idx+3, 0]
 
         # Expected measurement and Jacobian
-        h = self.h_range(x_r, y_r, x_f, y_f)
+        dx = x_f - x_r
+        dy = y_f - y_r
+        dz = z_f - z_r
+        dist = max(np.sqrt(dx**2 + dy**2 + dz**2), 1e-6)
+        h = np.array([[dist]])
         H = np.zeros((1, len(xk)))
         
         # Range derivatives
@@ -494,9 +505,10 @@ class FEKFSLAM(EKFNode):
         # Jacobian components
         H[0, 0] = -dx/dist  
         H[0, 1] = -dy/dist  
-        H[0, 2] = 0         
+        H[0, 2] = -dz / dist       
         H[0, start_idx] = dx/dist    
-        H[0, start_idx+1] = dy/dist 
+        H[0, start_idx+1] = dy/dist
+        H[0, start_idx + 2] = dz / dist 
 
         # Kalman update
         innovation = zn - h
@@ -508,6 +520,9 @@ class FEKFSLAM(EKFNode):
 
         # Visualize innovation
         self.visualize_innovation(innovation, (x_r, y_r, 0))
+
+        # Visualise landmarks
+        self.visualize_all_landmarks()
 
         return xk, Pk
 
@@ -594,7 +609,7 @@ class FEKFSLAM(EKFNode):
 
         for aruco_id, (idx, _) in self.observed_arucos.items():
             start_idx = self.xB_dim + idx * self.xF_dim
-            x, y = self.xk[start_idx:start_idx+2, 0]
+            x, y, z = self.xk[start_idx:start_idx+3, 0]
             cov = self.Pk[start_idx:start_idx+2, start_idx:start_idx+2]
             
             # Landmark marker
@@ -607,7 +622,7 @@ class FEKFSLAM(EKFNode):
             marker.action = Marker.ADD
             marker.pose.position.x = x
             marker.pose.position.y = y
-            marker.pose.position.z = 0.0
+            marker.pose.position.z = z
             marker.scale.x = 0.2
             marker.scale.y = 0.2
             marker.scale.z = 0.1
@@ -652,7 +667,7 @@ class FEKFSLAM(EKFNode):
             text_marker.action = Marker.ADD
             text_marker.pose.position.x = x
             text_marker.pose.position.y = y
-            text_marker.pose.position.z = 0.3
+            text_marker.pose.position.z = z
             text_marker.scale.z = 0.2
             text_marker.color = ColorRGBA(1.0, 1.0, 1.0, 1.0)
             text_marker.text = str(aruco_id)
@@ -663,7 +678,6 @@ class FEKFSLAM(EKFNode):
 
         self.landmark_pub.publish(marker_array)
 
-   
 
 if __name__ == '__main__':
     rospy.init_node('fekf_slam_node')
