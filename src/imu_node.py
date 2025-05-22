@@ -28,7 +28,7 @@ class imuNode:
         # Convert angle from quaternion to yaw
         _, _, yaw = tf_trans.euler_from_quaternion(quaternion)
         yaw = self.normalise_angle(yaw)
-
+        
         # Publish yaw as the compass heading
         self.heading_pub.publish(Float64(yaw))
     

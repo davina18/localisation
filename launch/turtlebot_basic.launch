@@ -50,13 +50,6 @@
             <remap from="cmd_vel" to="/$(arg robot_name)/kobuki/commands/velocity"/>
             <remap from="wheel_velocities" to="/$(arg robot_name)/kobuki/commands/wheel_velocities"/>
         </node>
-
-        <!-- Run Simple Odometry -->
-        <!-- <node name="diff_drive_odom" pkg="turtlebot_simulation" type="diff_drive_odom.py" output="screen">
-            <rosparam command="load" file="$(find turtlebot_simulation)/config/turtlebot_odom.yaml" />
-            <remap from="joint_states" to="/$(arg robot_name)/joint_states"/>
-            <remap from="odom" to="/$(arg robot_name)/kobuki/odom"/>
-        </node> -->
         
         <node name="world_ned_to_odom" pkg="tf2_ros" type="static_transform_publisher" args="0 0 0 0 0 0 world_ned odom"/>
  

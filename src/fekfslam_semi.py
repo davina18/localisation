@@ -34,10 +34,12 @@ class FEKFSLAM(EKFNode):
         # Wheel parameters
         self.wheel_radius = 0.035  # meters
         self.wheel_base_distance = 0.23  # meters
+        #self.Qk = np.diag([0.05, 0.05, 0.01])  # process noise covariance
 
-        # Wheel joints
+        # Wheel joint names
         self.left_wheel_name = 'turtlebot/kobuki/wheel_left_joint'
         self.right_wheel_name = 'turtlebot/kobuki/wheel_right_joint'
+
         self.left_wheel_velocity_received = False
         self.right_wheel_velocity_received = False
 
@@ -54,11 +56,14 @@ class FEKFSLAM(EKFNode):
         self.last_time = self.current_time
         self.time = 0.0
 
+        # Flag to wait until both velocities are received
+        self.left_wheel_velocity_received = False
+
         # Aruco observations
         self.aruco_observations = {}  # {aruco_id: [(robot_pose, range)]}
         self.triangulation_dist_threshold = 0.3
 
-        # Arucos in robot state
+        # Marker tracking
         self.observed_arucos = {}  # {aruco_id: (state_index, last_seen_time)}
         self.next_feature_idx = 0
 
@@ -78,14 +83,13 @@ class FEKFSLAM(EKFNode):
         self.landmark_pub = rospy.Publisher("/landmark_markers", MarkerArray, queue_size=10)
         self.uncertainty_pub = rospy.Publisher("/uncertainty_ellipse", Marker, queue_size=10)
         self.range_marker_pub = rospy.Publisher("/range_line_marker", Marker, queue_size=10)
-        self.camera_marker_pub = rospy.Publisher("/camera_pose_marker", Marker, queue_size=10)
 
         # Subscribers
         rospy.Subscriber("/aruco_range", ArucoRange, self.range_callback)
-        #rospy.Subscriber("/compass_heading", Float64, self.imu_yaw_callback)
+        rospy.Subscriber("/compass_heading", Float64, self.imu_yaw_callback)
         rospy.Subscriber('/turtlebot/joint_states', JointState, self.joint_states_callback)
 
-        # Ground truth pose tracking
+        # Ground truth pose tracking (optional)
         self.ground_truth_position = np.zeros(3)
         rospy.Subscriber("/turtlebot/kobuki/odom_ground_truth", Odometry, self.gt_odom_callback)
 
@@ -97,19 +101,13 @@ class FEKFSLAM(EKFNode):
     def camera_pose(self):
         # Robot base in world_ned
         x_r, y_r, theta_r = self.xk[0:3, 0]
-        # Camera offset in robot frame (from URDF): 0.122m forward, -0.033m to the side, 0.082m up
-        forward, side, up = 0.122, -0.033, 0.082
+        # Camera offset in robot frame (from URDF): 0.1115m forward, 0.0m to the side, 0.0945m up
+        forward, side, up = 0.1115, 0.0, 0.0945
         cos_theta_r, sin_theta_r = np.cos(theta_r), np.sin(theta_r)
         # Compute cameras position in world_ned by adding the rotated offset
-        x_cam = x_r + cos_theta_r*forward + sin_theta_r*side
-        y_cam = y_r + sin_theta_r*forward - cos_theta_r*side
-        z_cam = up
-
-        dx = cos_theta_r * forward - sin_theta_r * side
-        dy = sin_theta_r * forward + cos_theta_r * side
-        offset_angle = np.degrees(np.arctan2(dy, dx))
-        rospy.logwarn(f"[DEBUG] Robot θ={np.degrees(theta_r):.1f}°, Camera offset dx={dx:.2f}, dy={dy:.2f}, ∠offset={offset_angle:.1f}°")
-        return np.array([x_cam, y_cam, z_cam, theta_r])
+        x_cam = x_r + cos_theta_r*forward - sin_theta_r*side
+        y_cam = y_r + sin_theta_r*forward + cos_theta_r*side
+        return np.array([x_cam, y_cam, theta_r])
     
     # ---------------------------------------------- Callback Functions ------------------------------------------------
     def joint_states_callback(self, msg):
@@ -143,9 +141,10 @@ class FEKFSLAM(EKFNode):
 
             uk = [self.linear_velocity, self.angular_velocity, self.time]
             self.xk, self.Pk = self.prediction(uk, self.Qk, self.xk, self.Pk)
+            #rospy.loginfo(f"Updated pose: x={self.xk[0,0]:.2f}, y={self.xk[1,0]:.2f}, yaw={self.xk[2,0]:.2f}")
             if np.isnan(self.xk).any():
                 rospy.logwarn("NaN detected in xk after prediction!")
-            self.update_visualisations()
+            self.update_paths()
 
             self.left_wheel_velocity_received = False
             self.right_wheel_velocity_received = False
@@ -154,9 +153,10 @@ class FEKFSLAM(EKFNode):
         """
         Handle yaw data published as Float64 from /compass_heading.
         """
-        yaw_meas = msg.data         # extract the float value
-        R_yaw = np.array([[0.2]])   # adjust noise if needed
+        yaw_meas = msg.data  # Extract the float value
+        R_yaw = np.array([[0.2]])  # Adjust noise if needed
         self.xk, self.Pk = self.update_yaw(self.xk, self.Pk, yaw_meas, R_yaw)
+
 
     def gt_odom_callback(self, msg):
         """Record ground truth position for visualization"""
@@ -178,71 +178,73 @@ class FEKFSLAM(EKFNode):
         self.ground_truth_path_pub.publish(self.ground_truth_path)
         #self.publish_ground_truth_path_marker()
 
+
     def range_callback(self, msg):
         """Handle new range measurement"""
         aruco_id = msg.aruco_id
         range_measurement = msg.range
-        x_cam, y_cam, z_cam, theta_cam = self.camera_pose() # camera pose in the world frame
-        cam_pose = np.array([x_cam, y_cam, theta_cam])
+        camera_pose = self.camera_pose() # camera pose in the world frame
 
         # If the aruco hasn't been observed before, initialise an observation list for it
         if aruco_id not in self.aruco_observations:
             self.aruco_observations[aruco_id] = []
 
         # Add the robots current pose and range measurement to the arucos observation list
-        self.aruco_observations[aruco_id].append((cam_pose, range_measurement))
-        observations = self.aruco_observations[aruco_id]
+        self.aruco_observations[aruco_id].append((camera_pose, range_measurement))
 
-        # If at least 3 observations of this aruco have been made
+        observations = self.aruco_observations[aruco_id]
+        # If at least 2 observations of this aruco have been made
         if len(observations) >= 3:
             # Compute the Euclidean distance between the first pose and most recent pose 
             p1, _ = observations[0]
             p2, _ = observations[-1]
             dist = np.linalg.norm(p2[0:2] - p1[0:2])
-
-            # Only triangulate if higher than the distance threshold
+            # Only triangulate if lower than the distance threshold
             if dist >= self.triangulation_dist_threshold:
-                
-                # Return if aruco has already been added to the state
                 if aruco_id in self.observed_arucos:
-                    Rn = np.array([[0.1]]) # measurement noise
+                    Rn = np.array([[0.1]])  # measurement noise
                     self.xk, self.Pk = self.update(self.xk, self.Pk, range_measurement, Rn, aruco_id)
-                    return
-                
+                    return # aruco already added to state
                 # Estimate the position of the landmark using triangulation
                 landmark_pos = self.triangulate(observations)
+                # Report triangulation failure
                 if landmark_pos is None:
                     rospy.logwarn(f"Triangulation failed for Aruco ID {aruco_id}")
                     return None
-                
-                cov = np.diag([0.2, 0.2, 0.2])                                                      # manually set initial covariance of new landmark
-                area_before = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))                     # uncertainty ellipse area before new landmark addition
-                self.add_new_landmark(aruco_id, landmark_pos, cov)                                  # add new landmark to robot state using estimated pos and cov
-                Rn = np.array([[0.1]])                                                              # measurement noise
-                self.xk, self.Pk = self.update(self.xk, self.Pk, range_measurement, Rn, aruco_id)   # update step
-                area_after = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))                      # uncertainty ellipse area after new landmark addition
+                # Manually set an initial covariance for the new landmark
+                cov = np.diag([0.2, 0.2, 0.2])
+                # Print uncertainty ellipse area before new landmark addition
+                area_before = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))
+                # Add the new landmark to the robot state using the estimated pos and cov
+                self.add_new_landmark(aruco_id, landmark_pos, cov)
+                # Update step
+                Rn = np.array([[0.1]])  # measurement noise
+                self.xk, self.Pk = self.update(self.xk, self.Pk, range_measurement, Rn, aruco_id)
+                # Print uncertainty ellipse area after new landmark addition
+                area_after = np.pi * np.sqrt(np.linalg.det(self.Pk[0:2, 0:2]))
                 rospy.loginfo(f"Uncertainty ellipse area before: {area_before:.4f}, after: {area_after:.4f}")
                 self.visualize_range_circle(np.linalg.norm(landmark_pos[0:2] - self.xk[0:2, 0].reshape(2,1)))
                 del self.aruco_observations[aruco_id]
                 rospy.loginfo(f"Added landmark {aruco_id} at {landmark_pos.ravel()} with covariance {np.diag(cov)}")
+        
 
     # ----------------------------------------------- SLAM Functions -------------------------------------------------
 
-    def h_cam(self, xk, aruco_id):
+    def h_camera(self, xk, aruco_id):
         """Expected range from camera to landmark in world_ned."""
-        x_cam, y_cam, z_cam, _ = self.camera_pose()
+        x_cam, y_cam, _ = self.camera_pose()
         idx, _ = self.observed_arucos[aruco_id]
         start_idx = self.xB_dim + idx * self.xF_dim
         x_f, y_f, z_f = xk[start_idx:start_idx + 3, 0]
-        return self.h_cam_range(x_cam, y_cam, z_cam, x_f, y_f, z_f)
+        return self.h_cam_range(x_cam, y_cam, 0.0, x_f, y_f, z_f)
 
-    def H_cam(self, xk, aruco_id):
+    def H_camera(self, xk, aruco_id):
         """Jacobian of that range w.r.t. full state."""
-        x_cam, y_cam, z_cam, _ = self.camera_pose()
+        x_cam, y_cam, _ = self.camera_pose()
         idx, _ = self.observed_arucos[aruco_id]
         start_idx = self.xB_dim + idx*self.xF_dim
         x_f, y_f, z_f = xk[start_idx:start_idx + 3, 0]
-        dx, dy, dz = x_f - x_cam, y_f - y_cam, z_f - z_cam
+        dx, dy, dz = x_f - x_cam, y_f - y_cam, z_f
         dist = max(np.sqrt(dx*dx + dy*dy + dz*dz), 1e-6)
         H = np.zeros((1, xk.shape[0]))
 
@@ -250,7 +252,7 @@ class FEKFSLAM(EKFNode):
         H[0, 0] = -dx/dist
         H[0, 1] = -dy/dist
         H[0, 2] = -dz/dist
-
+        
         # Landmark columns
         H[0, start_idx    ] =  dx/dist
         H[0, start_idx + 1] =  dy/dist
@@ -264,8 +266,9 @@ class FEKFSLAM(EKFNode):
         dz = z_f - z_cam
         return np.sqrt(dx*dx + dy*dy + dz*dz)
     
-    def update_visualisations(self):
-        """Update uncertainty ellipse and estimated and ground truth paths"""
+    def update_paths(self):
+        """Update both estimated and ground truth paths"""
+        #rospy.loginfo("Appending estimated pose to path")
 
         # Estimated path
         est_pose = PoseStamped()
@@ -277,46 +280,45 @@ class FEKFSLAM(EKFNode):
         est_pose.pose.orientation = Quaternion(*quaternion_from_euler(0, 0, self.xk[2,0]))
         self.estimated_path.poses.append(est_pose)
         self.estimated_path_pub.publish(self.estimated_path)
+        #rospy.loginfo(f"Publishing path with {len(self.estimated_path.poses)} poses")
         
-        # Publish uncertainty ellipse and paths
+        # Publish uncertainty ellipse
         self.publish_uncertainty_ellipse()
         self.publish_estimated_path_marker()
         #self.publish_ground_truth_path_marker()
-        self.visualize_camera_pose()
+    
     
     def triangulate(self, observations):
         def residuals(landmark_pos, observations):
             # Compute residuals (difference between predicted and observed range)
             residual_list = []
-            lx, ly, lz = landmark_pos                               # estimated landmark position
+            lx, ly, lz = landmark_pos  # estimated landmark position
             for pose, r in observations:
-                x, y, theta = pose                                  # robot pose
-                _, _, z_cam, _ = self.camera_pose()                 # camera height
-                dx = lx - x                                         # x difference
-                dy = ly - y                                         # y difference
-                dz = lz - z_cam                                     # z difference
-                predicted_range = np.sqrt(dx**2 + dy**2 + dz**2)    # Euclidean distance
-                residual_list.append(predicted_range - r)           # add residual (predicted - observed)
+                x, y, theta = pose  # robot pose
+                dx = lx - x # x difference
+                dy = ly - y # y difference
+                dz = lz # assume robot z = 0, so dz = lz - 0
+                predicted_range = np.sqrt(dx**2 + dy**2 + dz**2) # Euclidean distance
+                residual_list.append(predicted_range - r)  # add residual (predicted - observed)
             return residual_list
         
         # Generate initial estimate of the landmark position (using simplified asusumptions)
-        last_pose, last_range = observations[-1]                    # latest robot pose and range measurement
+        last_pose, last_range = observations[-1] # latest robot pose and range measurement
         # Estimate landmark position as being directly ahead, using robots heading and range measurement
         x0 = last_pose[0] + last_range * np.cos(last_pose[2])
         y0 = last_pose[1] + last_range * np.sin(last_pose[2])
-        _, _, z_cam, _ = self.camera_pose()
-        z0 = z_cam                                                  # assume landmarks are level with the camera
-        
+        z0 = 0.0  # assume landmark is on the ground
+
         # Use least squares to minimise residuals and estimate landmark position
         result = least_squares(residuals, x0=[x0, y0, z0], args=(observations,))
         
         if result.success:
-            return result.x.reshape(3, 1) # in world_ned
+            return result.x.reshape(3, 1) # in world_ned since its derived from robot poses in world_ned
         else:
-            return None                   # triangulation failed
+            return None  # triangulation failed
     
     def add_new_landmark(self, aruco_id, position, covariance):
-        # Return if the landmark has already been added to the state
+        # Skip if the landmark has already been added to the state
         if aruco_id in self.observed_arucos:
             return
 
@@ -330,23 +332,23 @@ class FEKFSLAM(EKFNode):
             [cross_cov.T, covariance]
         ])
 
-        # Add to list of observed arucos
+        # Log observation of aruco
         self.observed_arucos[aruco_id] = (self.next_feature_idx, rospy.Time.now().to_sec())
         self.next_feature_idx += 1
 
 
     def update(self, xk, Pk, zn, Rn, aruco_id):
         """Main EKF update with range measurements"""
-        # Ensure zn is a column vector
+        # Convert scalar to array if needed
         if isinstance(zn, (int, float)):
             zn = np.array([[zn]])
 
-        # Update landmarks last seen timestamp
+        # Existing feature update
         idx, _ = self.observed_arucos[aruco_id]
+        start_idx = self.xB_dim + idx * self.xF_dim
         self.observed_arucos[aruco_id] = (idx, rospy.Time.now().to_sec())
 
         # Handle timing issue where update() is called for a landmark not yet in the state
-        start_idx = self.xB_dim + idx * self.xF_dim
         if xk.shape[0] < start_idx + self.xF_dim:
             return xk, Pk
 
@@ -354,8 +356,8 @@ class FEKFSLAM(EKFNode):
         x_r, y_r, theta_r = xk[0:3, 0]
         
         # Expected measurement and its Jacobian
-        h = self.h_cam(xk, aruco_id)
-        H = self.H_cam(xk, aruco_id)
+        h = self.h_camera(xk, aruco_id)
+        H = self.H_camera(xk, aruco_id)
 
         # Kalman update
         innovation = zn - h
@@ -379,20 +381,21 @@ class FEKFSLAM(EKFNode):
 
         # Jacobian (only affects yaw)
         H = np.zeros((1, len(xk)))
-        H[0, 2] = 1  # only the yaw component
+        H[0, 2] = 1  # Only the yaw component
 
         # Kalman update
         S = H @ Pk @ H.T + R_yaw
         K = Pk @ H.T @ np.linalg.inv(S)
+        
         xk = xk + K @ innovation
         Pk = (np.eye(len(xk)) - K @ H) @ Pk
 
         return xk, Pk
     
-    # ---------------------------------------- Visualisation ---------------------------------------------
+    # ---------------------- Visualisation ----------------------
 
     def publish_uncertainty_ellipse(self):
-        """Visualize robot pose uncertainty as a 2D ellipse using get_ellipse"""
+        """Visualize robot pose uncertainty as a 2D ellipse using get_ellipse()"""
         cov = self.Pk[0:2, 0:2]
         center = self.xk[0:2, 0].reshape(2, 1)
         ellipse_points = get_ellipse(center, cov, sigma=3)
@@ -606,30 +609,6 @@ class FEKFSLAM(EKFNode):
             marker_array.markers.append(text_marker)
 
         self.landmark_pub.publish(marker_array)
-
-    def visualize_camera_pose(self):
-        x_cam, y_cam, z_cam, theta = self.camera_pose()
-
-        marker = Marker()
-        marker.header.frame_id = "world_ned"
-        marker.header.stamp = rospy.Time.now()
-        marker.ns = "camera_pose"
-        marker.id = 999
-        marker.type = Marker.ARROW
-        marker.action = Marker.ADD
-        marker.scale.x = 0.2  # Arrow length
-        marker.scale.y = 0.05
-        marker.scale.z = 0.05
-        marker.color = ColorRGBA(1.0, 1.0, 0.0, 1.0)  # Yellow
-
-        marker.pose.position.x = x_cam
-        marker.pose.position.y = y_cam
-        marker.pose.position.z = z_cam
-
-        q = quaternion_from_euler(0, 0, theta)
-        marker.pose.orientation = Quaternion(*q)
-
-        self.camera_marker_pub.publish(marker)
 
 
 if __name__ == '__main__':

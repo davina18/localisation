@@ -3,29 +3,25 @@ import math
 import rospy
 import tf
 import numpy as np
-from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import JointState, Imu
-from visualization_msgs.msg import Marker, MarkerArray
-import tf.transformations
-from tf.transformations import euler_from_quaternion, quaternion_from_euler
-from geometry_msgs.msg import Quaternion
-from std_msgs.msg import Header, ColorRGBA
-from geometry_msgs.msg import PoseStamped, Point
+from nav_msgs.msg import Odometry
+from visualization_msgs.msg import Marker
+from tf.transformations import quaternion_from_euler
 
 class EKFNode:
+    # ----------------------------------------------- Initialisation --------------------------------------------------
     def __init__(self):
-        #rospy.init_node('EKF_node')
-        
-        # Initialize parameters with proper values
+        # State dimensions
         self.xB_dim = 3
         self.xF_dim = 2
-        self.wheel_radius = 0.035  # in meters
-        self.wheel_base_distance = 0.23  # in meters
         
         # State variables
         self.xk_1 = np.zeros((self.xB_dim, 1))
         self.Pk_1 = np.diag([0.1, 0.1, 0.1])
         self.Qk = np.diag([0.1, 0.1])
+
+        # Wheel parameters
+        self.wheel_radius = 0.035        # in meters
+        self.wheel_base_distance = 0.23  # in meters
         
         # Current time
         self.current_time = rospy.Time.now()
@@ -34,45 +30,16 @@ class EKFNode:
         # Publishers
         self.odom_pub = rospy.Publisher('/wheel_odom', Odometry, queue_size=10)
         self.odom_broadcaster = tf.TransformBroadcaster()
-        self.path_pub = rospy.Publisher('/path', Path, queue_size=10)
-        self.path_marker_pub = rospy.Publisher('/path_marker', Marker, queue_size=10)
         self.marker_pub_odom = rospy.Publisher('/odom_uncertainity', Marker, queue_size=10)
-        
-        # Path initialization
-        self.path = Path()
-        self.path.header.frame_id = "world_ned"
-        
-        # Subscribers
-        #rospy.Subscriber('/turtlebot/joint_states', JointState, self.joint_state_callback)
-
-
-    '''def odom_callback(self, msg):
-        self.current_time = msg.header.stamp
-        v = msg.twist.twist.linear.x
-        w = msg.twist.twist.angular.z
-        
-        if self.last_time is None:
-            self.last_time = self.current_time
-            return
-
-        dt = (self.current_time - self.last_time).to_sec()
-        if dt <= 0:
-            return
-
-        uk = [v, w, dt]
-        xk_bar, Pk_bar = self.prediction(uk, self.Qk, self.xk_1, self.Pk_1)
-
-        self.xk_1 = xk_bar
-        self.Pk_1 = Pk_bar
-        self.last_time = self.current_time'''
-
+    
+    # ----------------------------------------------- Prediction --------------------------------------------------
     def prediction(self, uk, Qk, xk, Pk):
         v = uk[0]
         w = uk[1]
         t = uk[2]
         theta = xk[2, 0]
         
-        # Initialize xk_bar properly
+        # Initialize xk_bar
         xk_bar = xk.copy()
         xk_bar[0, 0] += np.cos(theta) * v * t
         xk_bar[1, 0] += np.sin(theta) * v * t
@@ -92,14 +59,14 @@ class EKFNode:
         ])
         
         # Extend Jacobians to match state size
-        n = len(xk)  # full state length
+        n = len(xk)             # full state length
         Pxx = np.eye(n)
         Pyy = np.zeros((n, 2))  # Qk must be 2x2: noise for [v, w]
 
         Pxx[:3, :3] = F1
         Pyy[:3, :2] = F2
 
-        # Update the state covariance matrix
+        # Update state covariance matrix
         Pk_bar = Pxx @ Pk @ Pxx.T + Pyy @ Qk @ Pyy.T
         
         # Publish odometry
@@ -107,6 +74,7 @@ class EKFNode:
 
         return xk_bar, Pk_bar
 
+    # ----------------------------------------------- Odometry --------------------------------------------------
     def publish_odometry(self, xk, Pk):
         q = quaternion_from_euler(0, 0, xk[2,0])
         
@@ -148,10 +116,3 @@ class EKFNode:
             odom.child_frame_id,
             odom.header.frame_id
         )
-
-'''if __name__ == '__main__':
-    try:
-        EKFNode()
-        rospy.spin()
-    except rospy.ROSInterruptException:
-        pass'''
